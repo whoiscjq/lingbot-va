@@ -37,6 +37,7 @@ from utils import (
     save_async,
 )
 
+import copy
 
 class VA_Server:
 
@@ -92,6 +93,9 @@ class VA_Server:
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
+        self.prompt_mask = job_config.get('prompt_mask', None)
+        if self.prompt_mask is not None:
+            print(f"========prompt_mask:{self.prompt_mask}=========")
         if self.env_type == 'robotwin_tshape':
             vae_half = load_vae(
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
@@ -267,9 +271,19 @@ class VA_Server:
                               latent_cond=None,
                               action_cond=None,
                               frame_st_id=0,
-                              patch_size=(1, 2, 2)):
+                              patch_size=(1, 2, 2),
+                              disable_prompt_mask=False):
         logger.info(f"FRAME START ID: {frame_st_id}")
         input_dict = dict()
+        if self.prompt_mask is not None and (frame_st_id-self.start_frame_st_id) > self.prompt_mask:
+            prompt_masked=True
+        else:
+            prompt_masked=False
+
+        if disable_prompt_mask:
+            prompt_masked=False
+        print(f"prompt_masked is {prompt_masked}")
+        # set prompt embedding as meaningless noise if prompt_masked, which can be used to verify the effect of prompt
         if latent_model_input is not None:
             input_dict['latent_res_lst'] = {
                 'noisy_latents':
@@ -283,8 +297,8 @@ class VA_Server:
                             latent_model_input.shape[-2] // patch_size[1],
                             latent_model_input.shape[-1] // patch_size[2], 0,
                             1, frame_st_id).to(self.device),
-                'text_emb':
-                self.prompt_embeds.to(self.dtype).clone(),
+                'text_emb': #torch.randn_like(self.prompt_embeds, dtype=self.dtype),
+                self.prompt_embeds.to(self.dtype).clone() if prompt_masked is False else torch.randn_like(self.prompt_embeds, dtype=self.dtype),
             }
             if latent_cond is not None:
                 input_dict['latent_res_lst'][
@@ -307,8 +321,8 @@ class VA_Server:
                             1,
                             frame_st_id,
                             action=True).to(self.device),
-                'text_emb':
-                self.prompt_embeds.to(self.dtype).clone(),
+                'text_emb': #torch.randn_like(self.prompt_embeds, dtype=self.dtype),
+                self.prompt_embeds.to(self.dtype).clone() if prompt_masked is False else torch.randn_like(self.prompt_embeds, dtype=self.dtype),
             }
 
             if action_cond is not None:
@@ -321,6 +335,16 @@ class VA_Server:
 
     def _encode_obs(self, obs):
         images = obs['obs']
+
+        import numpy as np
+        if isinstance(images, list):
+            print(f"DEBUG [Inject]: images is LIST, length = {len(images)}")
+            if len(images) > 0:
+                print(f"DEBUG [Inject]: type of first element = {type(images[0])}")
+        else:
+            print(f"DEBUG [Compute]: images is {type(images)}")
+
+
         if not isinstance(images, list):
             images = [images]
         if len(images) < 1:
@@ -373,7 +397,9 @@ class VA_Server:
         logger.info('Reset.')
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
-        self.frame_st_id = 0
+        self.frame_st_id = 0 
+        self.start_frame_st_id = 0 
+        #### initialize frame_st_id and start_frame_st_id
         self.init_latent = None
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
@@ -437,7 +463,7 @@ class VA_Server:
 
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
-        if frame_st_id == 0:
+        if frame_st_id == self.start_frame_st_id:
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
 
@@ -484,7 +510,7 @@ class VA_Server:
             for i, t in enumerate(tqdm(timesteps)):
                 last_step = i == len(timesteps) - 1
                 latent_cond = init_latent[:, :, 0:1].to(
-                    self.dtype) if frame_st_id == 0 else None
+                    self.dtype) if frame_st_id == self.start_frame_st_id else None
                 input_dict = self._prepare_latent_input(
                     latents,
                     None,
@@ -514,7 +540,7 @@ class VA_Server:
                                                   latents,
                                                   return_dict=False)
 
-                latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+                latents[:, :, 0:1] = latent_cond if frame_st_id == self.start_frame_st_id else latents[:, :, 0:1]
 
             for i, t in enumerate(tqdm(action_timesteps)):
                 last_step = i == len(action_timesteps) - 1
@@ -524,7 +550,7 @@ class VA_Server:
                         self.action_per_frame, 1
                     ],
                     device=self.device,
-                    dtype=self.dtype) if frame_st_id == 0 else None
+                    dtype=self.dtype) if frame_st_id == self.start_frame_st_id else None
 
                 input_dict = self._prepare_latent_input(
                     None,
@@ -553,7 +579,7 @@ class VA_Server:
                                                          actions,
                                                          return_dict=False)
 
-                actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+                actions[:, :, 0:1] = action_cond if frame_st_id == self.start_frame_st_id else actions[:, :, 0:1]
 
         actions[:, ~self.action_mask] *= 0
 
@@ -568,10 +594,11 @@ class VA_Server:
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
         save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+        #save_async(obs['state'], os.path.join(self.exp_save_root, f'state_data_{self.frame_st_id}.npy'))
         latent_model_input = self._encode_obs(obs)
-        if self.frame_st_id == 0:
+        if self.frame_st_id == self.start_frame_st_id:
             latent_model_input = torch.cat(
-                [self.init_latent, latent_model_input],
+                [self.init_latent, latent_model_input], # self.init_latent: obs of first frame
                 dim=2) if latent_model_input is not None else self.init_latent
 
         action_model_input = self.preprocess_action(obs['state'])
@@ -582,7 +609,10 @@ class VA_Server:
         input_dict = self._prepare_latent_input(latent_model_input,
                                                 action_model_input,
                                                 frame_st_id=self.frame_st_id)
-
+        
+        input_dict_to_save = copy.deepcopy(input_dict)
+        save_async(input_dict_to_save, os.path.join(self.exp_save_root, f'input_dict_{self.frame_st_id}.pt'))
+        
         with (
                 torch.no_grad(),
         ):
@@ -597,12 +627,69 @@ class VA_Server:
                              action_mode=True)
         torch.cuda.empty_cache()
         self.frame_st_id += latent_model_input.shape[2]
+    
+    
+
+    def _inject_kv_cache(self, obs):
+        input_dicts= obs["input_dicts"]
+
+        def to_device_recursive(data, device, dtype=torch.float32):
+            """
+            递归地将 dict/list 中的 numpy 数组或列表转换为指定设备和精度的 Tensor
+            """
+            if isinstance(data, np.ndarray):
+                # numpy -> tensor
+                return torch.from_numpy(data).to(device).to(dtype)
+            
+            elif isinstance(data, torch.Tensor):
+                # 已经是 tensor 了，确保设备对齐
+                return data.to(device).to(dtype)
+            
+            elif isinstance(data, dict):
+                # 递归处理字典
+                return {k: to_device_recursive(v, device, dtype) for k, v in data.items()}
+            
+            elif isinstance(data, list):
+                # 递归处理列表
+                return [to_device_recursive(v, device, dtype) for v in data]
+            
+            # int, float, str 等基础类型直接返回
+            return data
+
+        input_dicts = to_device_recursive(
+            input_dicts, 
+            device=self.device, 
+            dtype=self.dtype
+        )
+        # print(obses[0])
+        # print(len(obses))
+        # print(type(obses[0]))
+        ### obses : [{"obs":..., "state":...}, {"obs":..., "state":...}, ..., {"obs":..., "state":...}]
+        self.transformer.clear_pred_cache(self.cache_name)
+        for input_dict in input_dicts:
+            with (
+                    torch.no_grad(),
+            ):
+                self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                                update_cache=2,
+                                cache_name=self.cache_name,
+                                action_mode=False)
+
+                self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                                update_cache=2,
+                                cache_name=self.cache_name,
+                                action_mode=True)
+            latent_model_input=input_dict['latent_res_lst']['noisy_latents']
+            torch.cuda.empty_cache()
+            self.frame_st_id += latent_model_input.shape[2]
+            self.start_frame_st_id += latent_model_input.shape[2]
 
     @torch.no_grad()
     def infer(self, obs):
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        inject_kv_cache = obs.get('inject_kv_cache', False)
 
         if reset:
             logger.info(f"******************* Reset server ******************")
@@ -612,6 +699,11 @@ class VA_Server:
             logger.info(
                 f"################# Compute KV Cache #################")
             self._compute_kv_cache(obs)
+            return dict()
+        elif inject_kv_cache:
+            logger.info(
+                f"################# Inject KV Cache #################")
+            self._inject_kv_cache(obs)
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
@@ -664,6 +756,49 @@ class VA_Server:
         decoded_video = self.decode_one_video(pred_latent, 'np')[0]
         export_to_video(decoded_video, os.path.join(self.save_root, "demo.mp4"), fps=10)
 
+    @torch.no_grad()
+    def replay(self, pred_latent_lst: list):
+        self.video_processor = VideoProcessor(vae_scale_factor=1)
+        self._reset(self.job_config.prompt)
+        init_obs = self.load_init_obs()
+        pred_latent = torch.cat(pred_latent_lst, dim=2).to(self.device)
+        self.transformer.clear_cache(self.cache_name)
+        self.streaming_vae.clear_cache()
+        if self.streaming_vae_half:
+            self.streaming_vae_half.clear_cache()
+        del self.transformer
+        del self.streaming_vae_half
+        del self.text_encoder
+        torch.cuda.empty_cache()
+        decoded_video = self.decode_one_video(pred_latent, 'np')[0]
+        export_to_video(decoded_video, os.path.join(self.save_root, "replay_demo.mp4"), fps=10)
+
+def sort_key(file_name):
+    """
+    通过正则表达式提取文件名中的数字序号
+    例如: 'latents_12.pt' -> 12
+    """
+    
+    import re
+    match = re.search(r'latents_(\d+)\.pt', file_name)
+    return int(match.group(1)) if match else -1
+
+def load_latents(folder_path):
+    # 1. 获取目录下所有以 latents_ 开头并以 .pt 结尾的文件
+    import os
+    files = [f for f in os.listdir(folder_path) if f.startswith('latents_') and f.endswith('.pt')]
+    
+    # 2. 按序号大小进行排序''
+    files.sort(key=sort_key)
+    latent_list = []
+    for f in files:
+        file_path = os.path.join(folder_path, f)
+        # 加载 tensor
+        data = torch.load(file_path, map_location='cpu')
+        latent_list.append(data)
+    return latent_list
+
+
 def run(args):    
     
     config = VA_CONFIGS[args.config_name]
@@ -677,10 +812,18 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
+    if args.prompt_mask is not None:
+        config.prompt_mask=args.prompt_mask
     model = VA_Server(config)
     if config.infer_mode == 'i2va':
         logger.info(f"******************************USE I2AV mode******************************")
         model.generate()
+    elif config.infer_mode == 'replay':
+        logger.info(f"******************************USE replay mode******************************")
+        if config.latent_folder is None:
+            raise ValueError(f"Undesignated latent folder")
+        latent_list=load_latents(folder_path=config.latent_folder)
+        model.replay(pred_latent_lst=latent_list)
     elif config.infer_mode == 'server':
         logger.info(f"******************************USE Server mode******************************")
         run_async_server_mode(model, local_rank, config.host, port)
@@ -710,6 +853,18 @@ def main():
         type=str,
         default=None,
         help='save root'
+    )
+    parser.add_argument(
+        "--latent_folder",
+        type=str,
+        default=None,
+        help='save root'
+    )
+    parser.add_argument(
+        "--prompt_mask",
+        type=int,
+        default=None,
+        help='the frame that prompt_mask start'
     )
     args = parser.parse_args()
     run(args)

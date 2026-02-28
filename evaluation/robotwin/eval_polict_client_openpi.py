@@ -1,4 +1,5 @@
 import sys
+import torch
 import os
 import subprocess
 import matplotlib.pyplot as plt
@@ -6,7 +7,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/path/to/your/robowin")
+robowin_root = Path("/mnt/shared-storage-user/chenjunqi/RoboTwin")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -301,6 +302,7 @@ def main(usr_args):
     policy_name = usr_args["policy_name"]
     video_guidance_scale = usr_args["video_guidance_scale"]
     action_guidance_scale = usr_args["action_guidance_scale"]
+    inject_root= usr_args["inject_root"]
     instruction_type = 'seen'
     save_dir = None
     video_save_dir = None
@@ -313,6 +315,7 @@ def main(usr_args):
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
     args["save_root"] = save_root
+    args["inject_root"]=inject_root
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -437,6 +440,43 @@ def add_init_pose(new_pose, init_pose):
     right_pose = add_eef_pose(new_pose[8:], init_pose[8:])
     return np.concatenate([left_pose, right_pose])
 
+def extract_inject_pts(folder_path):
+    import re
+    import os
+
+    def get_sorted_files(prefix, extension):
+        """获取目录下指定前缀和后缀的文件，并按序号排序"""
+        # 匹配 prefix + _ + 数字 + extension
+        pattern = re.compile(rf'^{prefix}_(\d+)\.{extension}$')
+        
+        file_matches = []
+        if not os.path.exists(folder_path):
+            return []
+            
+        for f in os.listdir(folder_path):
+            match = pattern.match(f)
+            if match:
+                file_matches.append((int(match.group(1)), f))
+        
+        # 按数字序号排序
+        file_matches.sort(key=lambda x: x[0])
+        return [f[1] for f in file_matches]
+
+    # 1. 加载 obs 数据 (.pt 格式)
+    input_dict_files = get_sorted_files("input_dict", "pt")
+    input_dict_list = [torch.load(os.path.join(folder_path, f), map_location='cpu') for f in input_dict_files]
+
+
+    # 3. 长度和匹配校验
+    if  not input_dict_list:
+        print(f"Error: 文件夹为空或未找到匹配文件。路径: {folder_path}")
+        return None
+
+
+    # 4. 合并为模型要求的格式
+    # 每个元素是一个字典，包含 'obs' (图像数据) 和 'state' (numpy 数组)
+    return input_dict_list
+
 def eval_policy(task_name,
                 TASK_ENV,
                 args,
@@ -464,6 +504,13 @@ def eval_policy(task_name,
     clear_cache_freq = args["clear_cache_freq"]
 
     args["eval_mode"] = True
+    
+    inject_root=args.get("inject_root",None)
+    if inject_root is not None:
+        input_dicts=extract_inject_pts(inject_root)
+        if not input_dicts:
+            raise FileNotFoundError("inject files not found!")
+
 
     while succ_seed < test_num:
         render_freq = args["render_freq"]
@@ -537,6 +584,32 @@ def eval_policy(task_name,
         prompt = TASK_ENV.get_instruction()
         ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
         
+        def tensor_to_numpy(obj):
+            if isinstance(obj, torch.Tensor):
+                # 核心修复：检测是否为 bfloat16，如果是，先转为 float32
+                if obj.dtype == torch.bfloat16:
+                    return obj.detach().cpu().to(torch.float32).numpy()
+                
+                # 处理其他常见的非数值类型或特殊类型（如 float16 也可能需要转 float32）
+                if obj.dtype == torch.float16:
+                    return obj.detach().cpu().to(torch.float32).numpy()
+                    
+                return obj.detach().cpu().numpy()
+            
+            elif isinstance(obj, dict):
+                return {k: tensor_to_numpy(v) for k, v in obj.items()}
+            
+            elif isinstance(obj, list):
+                return [tensor_to_numpy(v) for v in obj]
+            
+            return obj
+
+        
+        
+        if inject_root is not None:
+            # 在调用 model.infer 之前转换
+            input_dicts_np = tensor_to_numpy(input_dicts)
+            _ = model.infer(dict(inject_kv_cache=True, input_dicts=input_dicts_np))
         first = True
         full_obs_list = []
         gen_video_list = []
@@ -663,11 +736,12 @@ def parse_args_and_config():
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--test_num", type=int, default=100)
+    parser.add_argument("--inject_root", type=str, default=None)
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
-
+    config["inject_root"] = args.inject_root
     # Parse overrides
     def parse_override_pairs(pairs):
         override_dict = {}

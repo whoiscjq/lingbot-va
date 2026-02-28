@@ -1,2 +1,7 @@
 train_out/
 *.pyc
+visualization
+logs/
+inject_examples/*
+pids.txt
+test.py

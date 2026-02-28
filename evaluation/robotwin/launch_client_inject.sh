@@ -12,7 +12,7 @@ task_groups=(
 )
 
 save_root=${1:-'./results'}
-task_name=${2:-"stack_bowls_two"}
+task_name=${2:-"stack_bowls_three"}
 PORT=${PORT:-29056}
 TEST_NUM=${TEST_NUM:-100}
 
@@ -22,6 +22,7 @@ train_config_name=0
 model_name=0
 seed=0
 #PORT=29056
+inject_root="/mnt/shared-storage-user/chenjunqi/lingbot-va/inject_examples/two_bowls_example"
 
 PYTHONWARNINGS=ignore::UserWarning \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_client_openpi --config policy/$policy_name/deploy_policy.yml \
@@ -37,6 +38,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_cli
     --video_guidance_scale 5 \
     --action_guidance_scale 1 \
     --test_num ${TEST_NUM} \
-    --port ${PORT}
+    --port ${PORT} \
+    --inject_root ${inject_root}
 
 
